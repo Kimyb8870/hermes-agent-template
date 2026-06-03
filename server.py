@@ -1424,6 +1424,117 @@ async def ws_proxy(websocket: WebSocket) -> None:
 
 ANY_METHOD = ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"]
 
+
+# ---------------------------------------------------------------------------
+# Google Drive Push notification webhook (handler + helpers)
+# ---------------------------------------------------------------------------
+# Drive Changes.watch sends a POST with these headers:
+#   X-Goog-Channel-ID:     the channel UUID we registered
+#   X-Goog-Resource-State: "sync" (initial handshake) or "update" / "not_found"
+#   X-Goog-Resource-URI:   the watched resource
+#   X-Goog-Message-Number: monotonic, used to dedupe
+# Body is empty. We respond 200 immediately and trigger the pipeline async.
+_DRIVE_PUSH_STATE_FILE = Path("/data/.hermes/drive_push_state.json")
+_DRIVE_PUSH_PIPELINE = "/data/meeting_transcripts/automation/meeting_pipeline.py"
+_DRIVE_PUSH_KNOWN_CHANNELS: set[str] = set()  # populated on registration
+
+
+def _load_drive_push_state() -> dict:
+    """Persisted webhook state: seen message numbers + active channel ids."""
+    if _DRIVE_PUSH_STATE_FILE.exists():
+        try:
+            return json.loads(_DRIVE_PUSH_STATE_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {"seen_messages": [], "channels": []}
+
+
+def _save_drive_push_state(state: dict) -> None:
+    """Persist webhook state (write-once, cap seen-list size)."""
+    _DRIVE_PUSH_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _DRIVE_PUSH_STATE_FILE.write_text(
+        json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+
+
+def _trigger_meeting_pipeline_async(file_id):
+    """Spawn the meeting pipeline as a detached subprocess. Non-blocking."""
+    import subprocess
+    args = ["python", _DRIVE_PUSH_PIPELINE]
+    if file_id:
+        args.append(file_id)
+    try:
+        subprocess.Popen(
+            args,
+            stdout=open("/data/meeting_transcripts/automation/pipeline.log", "a"),
+            stderr=subprocess.STDOUT,
+            start_new_session=True,  # detach from this process
+        )
+    except Exception as exc:
+        # Last-ditch log; the webhook already returned 200 so we don't surface this.
+        log_path = Path("/data/meeting_transcripts/automation/webhook_errors.log")
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8") as fh:
+            fh.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] pipeline spawn failed: {exc!r}\n")
+
+
+async def webhook_drive_push(request: Request) -> Response:
+    """Receive Google Drive push notifications for the Meet Recordings folder.
+
+    Returns 200 immediately (Drive gives up on non-2xx fast and disables the
+    channel). The pipeline runs in a detached subprocess.
+    """
+    # Read once so the body is consumed even on early-return.
+    try:
+        body = await request.body()
+    except Exception:
+        body = b""
+
+    channel_id = request.headers.get("X-Goog-Channel-ID", "")
+    resource_state = request.headers.get("X-Goog-Resource-State", "")
+    message_number = request.headers.get("X-Goog-Message-Number", "0")
+
+    # Dedupe: drop messages we've already seen.
+    state = _load_drive_push_state()
+    seen = state.get("seen_messages", [])
+    if message_number and message_number in seen:
+        return JSONResponse({"ok": True, "deduped": True})
+
+    # Verify channel is one we registered (security: prevent random POSTs).
+    known = list(state.get("channels", [])) + list(_DRIVE_PUSH_KNOWN_CHANNELS)
+    if channel_id and known and channel_id not in known:
+        # Log + 200 anyway so Drive doesn't disable the channel; we'll just ignore.
+        log_path = Path("/data/meeting_transcripts/automation/webhook.log")
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8") as fh:
+            fh.write(
+                f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] "
+                f"unknown channel_id={channel_id!r} state={resource_state!r} "
+                f"msg#={message_number}\n"
+            )
+        return JSONResponse({"ok": True, "ignored": True, "reason": "unknown channel"})
+
+    # Persist state (cap seen-list to last 1000 entries to bound file size).
+    seen.append(message_number)
+    state["seen_messages"] = seen[-1000:]
+    _save_drive_push_state(state)
+
+    # Handshake message has state="sync"; only trigger pipeline on real updates.
+    if resource_state == "update":
+        # Fire-and-forget: the pipeline downloads, transcribes, and uploads the
+        # meeting minutes on its own. File ID is left None so the pipeline picks
+        # the most recent video in Meet Recordings itself.
+        _trigger_meeting_pipeline_async(file_id=None)
+
+    return JSONResponse({
+        "ok": True,
+        "channel_id": channel_id,
+        "resource_state": resource_state,
+        "message_number": message_number,
+        "pipeline_triggered": resource_state == "update",
+    })
+
+
 routes = [
     # Public — no auth required.
     Route("/health",                            route_health),
@@ -1454,6 +1565,12 @@ routes = [
     # /setup/* typos return a real 404 — not a silent proxy fallthrough.
     Route("/setup/{path:path}",                 route_setup_404,     methods=ANY_METHOD),
 
+    # Google Drive Push notification webhook.
+    # Drive POSTs here with X-Goog-* headers (Channel-ID, Resource-State, etc.).
+    # We verify the channel-id against a known set, then trigger the meeting
+    # pipeline for any new video file in the Meet Recordings folder.
+    Route("/webhooks/drive-push",               webhook_drive_push,  methods=["POST"]),
+
     # Reverse-proxy hermes's dashboard WebSockets (Chat tab + sidecar).
     # WebSocketRoute is matched independently of HTTP routes, so order
     # relative to the catch-all HTTP `Route("/{path:path}", ...)` below
@@ -1479,6 +1596,21 @@ routes = [
 # No middleware — auth is enforced per-handler via guard(). This keeps /health
 # and /login truly unauthenticated without middleware gymnastics.
 app = Starlette(routes=routes, lifespan=lifespan)
+
+
+# ---------------------------------------------------------------------------
+# Google Drive Push notification webhook
+# ---------------------------------------------------------------------------
+# Drive Changes.watch sends a POST with these headers:
+#   X-Goog-Channel-ID:     the channel UUID we registered
+#   X-Goog-Resource-State: "sync" (initial handshake) or "update" / "not_found"
+#   X-Goog-Resource-URI:   the watched resource
+#   X-Goog-Message-Number: monotonic, used to dedupe
+# Body is empty. We respond 200 immediately and trigger the pipeline async.
+_DRIVE_PUSH_STATE_FILE = Path("/data/.hermes/drive_push_state.json")
+_DRIVE_PUSH_PIPELINE = "/data/meeting_transcripts/automation/meeting_pipeline.py"
+_DRIVE_PUSH_KNOWN_CHANNELS: set[str] = set()  # populated on registration
+
 
 if __name__ == "__main__":
     import uvicorn
